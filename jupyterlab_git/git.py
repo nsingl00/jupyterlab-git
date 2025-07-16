@@ -113,7 +113,7 @@ async def execute(
                 cwd=cwd,
                 env=env,
                 encoding="utf-8",
-                timeout=None,
+                timeout=timeout,
             )
 
             # We expect a prompt from git
@@ -140,6 +140,19 @@ async def execute(
             returncode = p.exitstatus
             p.close()  # close process
             return returncode, "", response
+        except pexpect.exceptions.TIMEOUT:  # Handle timeout
+            p.terminate(force=True)
+            p.close()
+            raise TimeoutError(
+                f"Git authentication timed out after {timeout} seconds: {' '.join(cmdline)}"
+            )
+        except Exception as e:
+            # Ensure process is always closed on any exception
+            if p and p.isalive():
+                p.terminate(force=True)
+            if p:
+                p.close()
+            raise e
 
     def call_subprocess(
         cmdline: "List[str]",
@@ -150,7 +163,21 @@ async def execute(
         process = subprocess.Popen(
             cmdline, stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=cwd, env=env
         )
-        output, error = process.communicate()
+        try:
+            output, error = process.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            # Terminate the process gracefully
+            process.terminate()
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                # Force kill if still alive after 5 seconds
+                process.kill()
+                process.wait()
+            raise TimeoutError(
+                f"Git command timed out after {timeout} seconds: {' '.join(cmdline)}"
+            )
+
         if is_binary:
             return (
                 process.returncode,
@@ -198,6 +225,10 @@ async def execute(
         get_logger().debug(
             "Code: {}\nOutput: {}\nError: {}".format(code, log_output, log_error)
         )
+    except TimeoutError as e:
+        # Handle our custom timeout errors
+        code, output, error = -1, "", str(e)
+        get_logger().warning("Git command timed out: {!s}".format(cmdline))
     except BaseException as e:
         code, output, error = -1, "", traceback.format_exc()
         get_logger().warning("Fail to execute {!s}".format(cmdline), exc_info=True)
@@ -228,8 +259,24 @@ class Git:
         )
 
     def __del__(self):
+        self._cleanup_processes()
+
+    def _cleanup_processes(self):
+        """Clean up any running processes managed by this Git instance."""
         if self._GIT_CREDENTIAL_CACHE_DAEMON_PROCESS:
-            self._GIT_CREDENTIAL_CACHE_DAEMON_PROCESS.terminate()
+            try:
+                if self._GIT_CREDENTIAL_CACHE_DAEMON_PROCESS.poll() is None:
+                    self._GIT_CREDENTIAL_CACHE_DAEMON_PROCESS.terminate()
+                    try:
+                        self._GIT_CREDENTIAL_CACHE_DAEMON_PROCESS.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        self._GIT_CREDENTIAL_CACHE_DAEMON_PROCESS.kill()
+                        self._GIT_CREDENTIAL_CACHE_DAEMON_PROCESS.wait()
+                    get_logger().debug("Git credential cache daemon process cleaned up")
+            except Exception as e:
+                get_logger().warning(f"Failed to cleanup credential cache daemon: {e}")
+            finally:
+                self._GIT_CREDENTIAL_CACHE_DAEMON_PROCESS = None
 
     async def __execute(
         self,
