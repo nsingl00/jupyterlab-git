@@ -228,10 +228,10 @@ async def execute(
     except TimeoutError as e:
         # Handle our custom timeout errors
         code, output, error = -1, "", str(e)
-        get_logger().warning("Git command timed out: {!s}".format(cmdline))
+        get_logger().warning(f"Git command timed out: {cmdline} - {str(e)}")
     except BaseException as e:
         code, output, error = -1, "", traceback.format_exc()
-        get_logger().warning("Fail to execute {!s}".format(cmdline), exc_info=True)
+        get_logger().warning(f"Failed to execute git command: {cmdline}", exc_info=True)
     finally:
         execution_lock.release()
 
@@ -272,7 +272,7 @@ class Git:
                     except subprocess.TimeoutExpired:
                         self._GIT_CREDENTIAL_CACHE_DAEMON_PROCESS.kill()
                         self._GIT_CREDENTIAL_CACHE_DAEMON_PROCESS.wait()
-                    get_logger().debug("Git credential cache daemon process cleaned up")
+                    get_logger().debug(f"Git credential cache daemon process (PID: {self._GIT_CREDENTIAL_CACHE_DAEMON_PROCESS.pid}) cleaned up successfully")
             except Exception as e:
                 get_logger().warning(f"Failed to cleanup credential cache daemon: {e}")
             finally:
