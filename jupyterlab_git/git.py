@@ -10,6 +10,7 @@ import re
 import shlex
 import shutil
 import subprocess
+import time
 import traceback
 from enum import Enum, IntEnum
 from pathlib import Path
@@ -53,6 +54,104 @@ GIT_STASH_LIST = re.compile(
 )
 
 execution_lock = tornado.locks.Lock()
+
+
+async def call_subprocess_with_authentication(
+    cmdline: "List[str]",
+    username: "str",
+    password: "str",
+    cwd: "Optional[str]" = None,
+    env: "Optional[Dict[str, str]]" = None,
+    timeout: "float" = 20,
+) -> "Tuple[int, str, str]":
+    """Call subprocess with authentication handling."""
+    try:
+        p = pexpect.spawn(
+            cmdline[0],
+            cmdline[1:],
+            cwd=cwd,
+            env=env,
+            encoding="utf-8",
+            timeout=timeout,
+        )
+
+        # We expect a prompt from git
+        # In most of cases git will prompt for username and
+        #  then for password
+        # In some cases (Bitbucket) username is included in
+        #  remote URL, so git will not ask for username
+        i = await p.expect(["Username for .*: ", "Password for .*:"], async_=True)
+        if i == 0:  # ask for username then password
+            p.sendline(username)
+            await p.expect("Password for .*:", async_=True)
+            p.sendline(password)
+        elif i == 1:  # only ask for password
+            p.sendline(password)
+
+        await p.expect(pexpect.EOF, async_=True)
+        response = p.before
+
+        returncode = p.wait()
+        p.close()
+        return returncode, "", response
+    except pexpect.exceptions.EOF:  # In case of pexpect failure
+        response = p.before
+        returncode = p.exitstatus
+        p.close()  # close process
+        return returncode, "", response
+    except pexpect.exceptions.TIMEOUT:  # Handle timeout
+        p.terminate(force=True)
+        p.close()
+        raise TimeoutError(
+            f"Git authentication timed out after {timeout} seconds: {' '.join(cmdline)}"
+        )
+    except Exception as e:
+        # Ensure process is always closed on any exception
+        if p and p.isalive():
+            p.terminate(force=True)
+        if p:
+            p.close()
+        raise e
+
+
+def call_subprocess(
+    cmdline: "List[str]",
+    cwd: "Optional[str]" = None,
+    env: "Optional[Dict[str, str]]" = None,
+    timeout: "float" = 20,
+    is_binary=False,
+) -> "Tuple[int, str, str]":
+    """Call subprocess with timeout and process cleanup."""
+    process = subprocess.Popen(
+        cmdline, stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=cwd, env=env
+    )
+    try:
+        output, error = process.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        # Terminate the process gracefully
+        process.terminate()
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            # Force kill if still alive after 5 seconds
+            process.kill()
+            process.wait()
+        get_logger().warning("Git command timed out: %s", cmdline)
+        raise TimeoutError(
+            f"Git command timed out after {timeout} seconds: {' '.join(cmdline)}"
+        )
+    except OSError as e:
+        get_logger().warning("Failed to execute git command: %s", cmdline)
+        raise
+
+    if is_binary:
+        return (
+            process.returncode,
+            base64.encodebytes(output).decode("ascii"),
+            error.decode("utf-8"),
+        )
+    else:
+        return (process.returncode, output.decode("utf-8"), error.decode("utf-8"))
 
 
 class State(IntEnum):
@@ -99,94 +198,6 @@ async def execute(
         (int, str, str): (return code, stdout, stderr)
     """
 
-    async def call_subprocess_with_authentication(
-        cmdline: "List[str]",
-        username: "str",
-        password: "str",
-        cwd: "Optional[str]" = None,
-        env: "Optional[Dict[str, str]]" = None,
-    ) -> "Tuple[int, str, str]":
-        try:
-            p = pexpect.spawn(
-                cmdline[0],
-                cmdline[1:],
-                cwd=cwd,
-                env=env,
-                encoding="utf-8",
-                timeout=timeout,
-            )
-
-            # We expect a prompt from git
-            # In most of cases git will prompt for username and
-            #  then for password
-            # In some cases (Bitbucket) username is included in
-            #  remote URL, so git will not ask for username
-            i = await p.expect(["Username for .*: ", "Password for .*:"], async_=True)
-            if i == 0:  # ask for username then password
-                p.sendline(username)
-                await p.expect("Password for .*:", async_=True)
-                p.sendline(password)
-            elif i == 1:  # only ask for password
-                p.sendline(password)
-
-            await p.expect(pexpect.EOF, async_=True)
-            response = p.before
-
-            returncode = p.wait()
-            p.close()
-            return returncode, "", response
-        except pexpect.exceptions.EOF:  # In case of pexpect failure
-            response = p.before
-            returncode = p.exitstatus
-            p.close()  # close process
-            return returncode, "", response
-        except pexpect.exceptions.TIMEOUT:  # Handle timeout
-            p.terminate(force=True)
-            p.close()
-            raise TimeoutError(
-                f"Git authentication timed out after {timeout} seconds: {' '.join(cmdline)}"
-            )
-        except Exception as e:
-            # Ensure process is always closed on any exception
-            if p and p.isalive():
-                p.terminate(force=True)
-            if p:
-                p.close()
-            raise e
-
-    def call_subprocess(
-        cmdline: "List[str]",
-        cwd: "Optional[str]" = None,
-        env: "Optional[Dict[str, str]]" = None,
-        is_binary=is_binary,
-    ) -> "Tuple[int, str, str]":
-        process = subprocess.Popen(
-            cmdline, stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=cwd, env=env
-        )
-        try:
-            output, error = process.communicate(timeout=timeout)
-        except subprocess.TimeoutExpired:
-            # Terminate the process gracefully
-            process.terminate()
-            try:
-                process.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                # Force kill if still alive after 5 seconds
-                process.kill()
-                process.wait()
-            raise TimeoutError(
-                f"Git command timed out after {timeout} seconds: {' '.join(cmdline)}"
-            )
-
-        if is_binary:
-            return (
-                process.returncode,
-                base64.encodebytes(output).decode("ascii"),
-                error.decode("utf-8"),
-            )
-        else:
-            return (process.returncode, output.decode("utf-8"), error.decode("utf-8"))
-
     try:
         await execution_lock.acquire(timeout=datetime.timedelta(seconds=timeout))
     except tornado.util.TimeoutError:
@@ -210,11 +221,12 @@ async def execute(
                 password,
                 cwd,
                 env,
+                timeout,
             )
         else:
             current_loop = tornado.ioloop.IOLoop.current()
             code, output, error = await current_loop.run_in_executor(
-                None, call_subprocess, cmdline, cwd, env
+                None, call_subprocess, cmdline, cwd, env, timeout, is_binary
             )
         log_output = (
             output[:MAX_LOG_OUTPUT] + "..." if len(output) > MAX_LOG_OUTPUT else output
@@ -228,10 +240,10 @@ async def execute(
     except TimeoutError as e:
         # Handle our custom timeout errors
         code, output, error = -1, "", str(e)
-        get_logger().warning("Git command timed out: {!s}".format(cmdline))
+        get_logger().warning("Git command timed out: %s - %s", cmdline, str(e))
     except BaseException as e:
         code, output, error = -1, "", traceback.format_exc()
-        get_logger().warning("Fail to execute {!s}".format(cmdline), exc_info=True)
+        get_logger().warning("Failed to execute git command: %s", cmdline, exc_info=True)
     finally:
         execution_lock.release()
 
@@ -271,10 +283,14 @@ class Git:
                         self._GIT_CREDENTIAL_CACHE_DAEMON_PROCESS.wait(timeout=5)
                     except subprocess.TimeoutExpired:
                         self._GIT_CREDENTIAL_CACHE_DAEMON_PROCESS.kill()
-                        self._GIT_CREDENTIAL_CACHE_DAEMON_PROCESS.wait()
-                    get_logger().debug("Git credential cache daemon process cleaned up")
+                        try:
+                            self._GIT_CREDENTIAL_CACHE_DAEMON_PROCESS.wait(timeout=1)
+                        except subprocess.TimeoutExpired:
+                            # If kill() doesn't work within 1 second, just give up
+                            pass
+                    get_logger().debug("Git credential cache daemon process (PID: %s) cleaned up successfully", self._GIT_CREDENTIAL_CACHE_DAEMON_PROCESS.pid)
             except Exception as e:
-                get_logger().warning(f"Failed to cleanup credential cache daemon: {e}")
+                get_logger().warning("Failed to cleanup credential cache daemon: %s", e)
             finally:
                 self._GIT_CREDENTIAL_CACHE_DAEMON_PROCESS = None
 
